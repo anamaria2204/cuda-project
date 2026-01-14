@@ -150,7 +150,7 @@ void cerceteaza_paralel() {
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    convolution_strip_kernel<<<1, p>>>(
+    convolution_strip_kernel<<<8, p>>>(
         f_device, c_device, n, m, k, 
         prev_row_buffers_device, temp_row_buffers_device, halo_buffers_device
     );

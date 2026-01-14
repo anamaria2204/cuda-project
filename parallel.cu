@@ -15,13 +15,39 @@ int k;
 int *c_host, *c_device;
 int p;
 
-__global__ void convolution_strip_kernel(int *f, int *c, int n, int m, int k, 
-                                         int *prev_row_buffers,  
-                                         int *temp_row_buffers,  
-                                         int *halo_buffers)      
+// --- KERNEL 1: Pregatire Halo (Salvam prima linie a fiecarui thread) ---
+__global__ void fill_halo_kernel(int *f, int n, int m, int *halo_buffers) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+
+    // Recalculam aceeasi distributie a liniilor
+    int rows_per_thread = n / total_threads;
+    int remainder = n % total_threads;
+    int start_row;
+
+    if (tid < remainder) {
+        start_row = tid * (rows_per_thread + 1);
+    } else {
+        int offset = remainder * (rows_per_thread + 1);
+        start_row = offset + (tid - remainder) * rows_per_thread;
+    }
+
+    if (start_row >= n) return;
+
+    // Salvam halo (prima linie) in buffer global
+    for (int j = 0; j < m; ++j) {
+        halo_buffers[tid * m + j] = f[start_row * m + j];
+    }
+}
+
+// --- KERNEL 2: Procesare Convolutie ---
+__global__ void convolution_compute_kernel(int *f, int *c, int n, int m, int k, 
+                                           int *prev_row_buffers,  
+                                           int *temp_row_buffers,  
+                                           int *halo_buffers)      
 {
-    int tid = threadIdx.x; 
-    int total_threads = blockDim.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
 
     int rows_per_thread = n / total_threads;
     int remainder = n % total_threads;
@@ -42,90 +68,71 @@ __global__ void convolution_strip_kernel(int *f, int *c, int n, int m, int k,
     int *my_prev_buffer = &prev_row_buffers[tid * m]; 
     int *my_temp_buffer = &temp_row_buffers[tid * m];
     
-    for (int j = 0; j < m; ++j) {
-        halo_buffers[tid * m + j] = f[start_row * m + j];
-    }
-    
-    __syncthreads();
+    // NU mai avem nevoie de salvarea halo aici si nici de __syncthreads()
+    // Deoarece Kernel 1 a garantat ca datele sunt acolo.
 
     int no_borders = 1;
 
     for (int i = start_row; i < end_row; ++i) {
         
+        // Initializare buffer prev la prima linie din chunk
         if (i == start_row && i > 0) {
              for(int j=0; j<m; ++j) my_prev_buffer[j] = f[(i-1) * m + j];
         }
 
-        // Calcul convolutie pentru linia i
+        // Calcul convolutie
         for (int j = 0; j < m; ++j) {
             int suma = 0;
-
-            // Iteram Kernel Linii (ki)
             for (int ki = -no_borders; ki <= no_borders; ++ki) {
                 int x = i + ki; 
                 int *source_row;
                 
-                // Cazul 1: Vecinul este 'i-1' (randul de sus)
+                // Cazul 1: Vecinul este 'i-1'
                 if (x < i) {
                     if (i == start_row) {
-                        // La startul chunk-ului, luam din global (e safe, vecinul de sus e departe)
                         source_row = (x < 0) ? f : &f[x * m]; 
                     } else {
-                        // In interiorul chunk-ului, luam din bufferul local
                         source_row = my_prev_buffer;
                     }
                 } 
-                // Cazul 2: Vecinul este 'i+1' (randul de jos)
+                // Cazul 2: Vecinul este 'i+1'
                 else if (x > i) {
                     int next_thread_start = end_row;
+                    // Aici e cheia: Citim din halo_buffers populate de Kernel 1
                     if (x == next_thread_start && (tid + 1) < total_threads) {
-                        source_row = &halo_buffers[(tid + 1) * m]; // Citim din HALO vecin
+                        source_row = &halo_buffers[(tid + 1) * m]; 
                     } else {
                         source_row = &f[x * m]; 
                     }
                 }
-                // Cazul 3: Vecinul este 'i' (randul curent)
+                // Cazul 3: Vecinul este 'i'
                 else {
                     source_row = &f[i * m];
                 }
                 
-                // Iteram Kernel Coloane (kj)
                 for (int kj = -no_borders; kj <= no_borders; ++kj) {
                     int val;
-                    
-                    // Calculam indexul coloanei cu clamp
                     int y = j + kj;
                     int y_clamped = (y < 0) ? 0 : (y >= m ? m - 1 : y);
                     
-                    // Verificam daca source_row este un buffer special sau pointer in f
                     bool is_buffer = (source_row == my_prev_buffer) || 
                                      (source_row >= halo_buffers && source_row < halo_buffers + total_threads * m);
 
                     if (is_buffer) {
-                         // Daca e buffer, accesam direct indexul [y_clamped]
                          val = source_row[y_clamped];
                     } else {
-                         // Daca e pointer in F global, trebuie sa avem grija la indexare
-                         // source_row este deja &f[x*m] SAU f (daca x<0).
                          int x_clamped = (x < 0) ? 0 : (x >= n ? n - 1 : x);
                          val = f[x_clamped * m + y_clamped];
                     }
-                    
                     suma += val * c[(ki + no_borders) * k + (kj + no_borders)];
                 }
             }
             my_temp_buffer[j] = suma;
         }
 
-        // Salvam linia curenta in prev pentru iteratia urmatoare
-        for(int j=0; j<m; ++j) {
-            my_prev_buffer[j] = f[i * m + j];
-        }
-
-        // Scriem rezultatul (In-Place)
-        for(int j=0; j<m; ++j) {
-            f[i * m + j] = my_temp_buffer[j];
-        }
+        // Update buffers
+        for(int j=0; j<m; ++j) my_prev_buffer[j] = f[i * m + j];
+        for(int j=0; j<m; ++j) f[i * m + j] = my_temp_buffer[j];
     }
 }
 
@@ -133,14 +140,19 @@ void cerceteaza_paralel() {
     cudaMalloc(&f_device, n * m * sizeof(int));
     cudaMalloc(&c_device, k * k * sizeof(int));
     
+    // CONFIGURARE BLOCURI
+    int blocks = 8;
+    int total_threads_global = blocks * p; // Numar total fire in tot gridul
+
+    // ALOCARE CORECTA: Inmultim cu total_threads_global, nu doar cu p!
     int *prev_row_buffers_device;
-    cudaMalloc(&prev_row_buffers_device, p * m * sizeof(int));
+    cudaMalloc(&prev_row_buffers_device, total_threads_global * m * sizeof(int));
     
     int *temp_row_buffers_device;
-    cudaMalloc(&temp_row_buffers_device, p * m * sizeof(int));
+    cudaMalloc(&temp_row_buffers_device, total_threads_global * m * sizeof(int));
     
     int *halo_buffers_device; 
-    cudaMalloc(&halo_buffers_device, p * m * sizeof(int));
+    cudaMalloc(&halo_buffers_device, total_threads_global * m * sizeof(int));
 
     cudaCheckError();
 
@@ -150,14 +162,24 @@ void cerceteaza_paralel() {
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    convolution_strip_kernel<<<8, p>>>(
+    cerr << "Configurare: " << blocks << " blocuri x " << p << " thread-uri. Total: " << total_threads_global << "\n";
+
+    // PASUL 1: Umplem Halo
+    fill_halo_kernel<<<blocks, p>>>(f_device, n, m, halo_buffers_device);
+    cudaCheckError();
+    
+    // PASUL 2: Bariera Globala (CPU Sync)
+    // Asigura ca toate blocurile au scris halo-ul inainte ca cineva sa citeasca
+    cudaDeviceSynchronize(); 
+
+    // PASUL 3: Calcul
+    convolution_compute_kernel<<<blocks, p>>>(
         f_device, c_device, n, m, k, 
         prev_row_buffers_device, temp_row_buffers_device, halo_buffers_device
     );
-    
     cudaCheckError();
-    cudaDeviceSynchronize();
     
+    cudaDeviceSynchronize();
     auto end_time = chrono::high_resolution_clock::now();
 
     cudaMemcpy(f_host, f_device, n * m * sizeof(int), cudaMemcpyDeviceToHost);

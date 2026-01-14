@@ -15,70 +15,117 @@ int k;
 int *c_host, *c_device;
 int p;
 
-// Kernel cu distributie STATICA a coloanelor (Chunking)
-__global__ void convolution_row_kernel(int *f, int *c, int *prev_row_buffer, int n, int m, int k, int row_idx, int *temp_row) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_threads = gridDim.x * blockDim.x;
+__global__ void convolution_strip_kernel(int *f, int *c, int n, int m, int k, 
+                                         int *prev_row_buffers,  
+                                         int *temp_row_buffers,  
+                                         int *halo_buffers)      
+{
+    int tid = threadIdx.x; 
+    int total_threads = blockDim.x;
 
-    // Incarcare kernel in shared memory
-    extern __shared__ int shared_kernel[];
-    int local_tid = threadIdx.x;
-    for (int idx = local_tid; idx < k * k; idx += blockDim.x) {
-        shared_kernel[idx] = c[idx];
+    int rows_per_thread = n / total_threads;
+    int remainder = n % total_threads;
+
+    int start_row, end_row; 
+
+    if (tid < remainder) {
+        start_row = tid * (rows_per_thread + 1);
+        end_row = start_row + rows_per_thread + 1;
+    } else {
+        int offset = remainder * (rows_per_thread + 1);
+        start_row = offset + (tid - remainder) * rows_per_thread;
+        end_row = start_row + rows_per_thread;
     }
+
+    if (start_row >= n) return; 
+
+    int *my_prev_buffer = &prev_row_buffers[tid * m]; 
+    int *my_temp_buffer = &temp_row_buffers[tid * m];
+    
+    for (int j = 0; j < m; ++j) {
+        halo_buffers[tid * m + j] = f[start_row * m + j];
+    }
+    
     __syncthreads();
 
-    int i = row_idx;
     int no_borders = 1;
 
-    // Calculam cate elemente (coloane) revin fiecarui thread
-    int count = m / total_threads;
-    int remainder = m % total_threads;
-
-    int start, end;
-
-    // Primele 'remainder' thread-uri primesc count + 1 elemente
-    // Restul thread-urilor primesc count elemente
-    if (tid < remainder) {
-        start = tid * (count + 1);
-        end = start + count + 1;
-    } else {
-        // Offset-ul este dat de cele 'remainder' thread-uri care au luat cate (count+1)
-        // plus cele (tid - remainder) thread-uri dinaintea mea care au luat cate count
-        int offset = remainder * (count + 1);
-        start = offset + (tid - remainder) * count;
-        end = start + count;
-    }
-
-    // Procesare interval continuu [start, end)
-    for (int j = start; j < end; ++j) {
-        if (j >= m) break; // Safety check limite
-
-        int suma = 0;
-
-        // Iterare vecini pe verticala (fereastra kernel)
-        for (int ki = -no_borders; ki <= no_borders; ++ki) {
-            int x = i + ki;
-            int x_clamped = (x < 0) ? 0 : (x >= n ? n - 1 : x); // Clamp la margini (padding)
-
-            int *source;
-            // Daca accesam randul anterior (deja suprascris in f), citim varianta originala din buffer
-            if (x_clamped < i) {
-                source = prev_row_buffer;
-            } else {
-                source = &f[x_clamped * m];
-            }
-
-            // Iterare vecini pe orizontala
-            for (int kj = -no_borders; kj <= no_borders; ++kj) {
-                int y = j + kj;
-                int y_clamped = (y < 0) ? 0 : (y >= m ? m - 1 : y);
-                
-                // Calcul convolutie folosind kernel-ul optimizat din Shared Memory
-                suma += source[y_clamped] * shared_kernel[(ki + no_borders) * k + (kj + no_borders)];
-            }
+    for (int i = start_row; i < end_row; ++i) {
+        
+        if (i == start_row && i > 0) {
+             for(int j=0; j<m; ++j) my_prev_buffer[j] = f[(i-1) * m + j];
         }
-        temp_row[j] = suma;
+
+        // Calcul convolutie pentru linia i
+        for (int j = 0; j < m; ++j) {
+            int suma = 0;
+
+            // Iteram Kernel Linii (ki)
+            for (int ki = -no_borders; ki <= no_borders; ++ki) {
+                int x = i + ki; 
+                int *source_row;
+                
+                // Cazul 1: Vecinul este 'i-1' (randul de sus)
+                if (x < i) {
+                    if (i == start_row) {
+                        // La startul chunk-ului, luam din global (e safe, vecinul de sus e departe)
+                        source_row = (x < 0) ? f : &f[x * m]; 
+                    } else {
+                        // In interiorul chunk-ului, luam din bufferul local
+                        source_row = my_prev_buffer;
+                    }
+                } 
+                // Cazul 2: Vecinul este 'i+1' (randul de jos)
+                else if (x > i) {
+                    int next_thread_start = end_row;
+                    if (x == next_thread_start && (tid + 1) < total_threads) {
+                        source_row = &halo_buffers[(tid + 1) * m]; // Citim din HALO vecin
+                    } else {
+                        source_row = &f[x * m]; 
+                    }
+                }
+                // Cazul 3: Vecinul este 'i' (randul curent)
+                else {
+                    source_row = &f[i * m];
+                }
+                
+                // Iteram Kernel Coloane (kj)
+                for (int kj = -no_borders; kj <= no_borders; ++kj) {
+                    int val;
+                    
+                    // Calculam indexul coloanei cu clamp
+                    int y = j + kj;
+                    int y_clamped = (y < 0) ? 0 : (y >= m ? m - 1 : y);
+                    
+                    // Verificam daca source_row este un buffer special sau pointer in f
+                    bool is_buffer = (source_row == my_prev_buffer) || 
+                                     (source_row >= halo_buffers && source_row < halo_buffers + total_threads * m);
+
+                    if (is_buffer) {
+                         // Daca e buffer, accesam direct indexul [y_clamped]
+                         val = source_row[y_clamped];
+                    } else {
+                         // Daca e pointer in F global, trebuie sa avem grija la indexare
+                         // source_row este deja &f[x*m] SAU f (daca x<0).
+                         int x_clamped = (x < 0) ? 0 : (x >= n ? n - 1 : x);
+                         val = f[x_clamped * m + y_clamped];
+                    }
+                    
+                    suma += val * c[(ki + no_borders) * k + (kj + no_borders)];
+                }
+            }
+            my_temp_buffer[j] = suma;
+        }
+
+        // Salvam linia curenta in prev pentru iteratia urmatoare
+        for(int j=0; j<m; ++j) {
+            my_prev_buffer[j] = f[i * m + j];
+        }
+
+        // Scriem rezultatul (In-Place)
+        for(int j=0; j<m; ++j) {
+            f[i * m + j] = my_temp_buffer[j];
+        }
     }
 }
 
@@ -86,12 +133,15 @@ void cerceteaza_paralel() {
     cudaMalloc(&f_device, n * m * sizeof(int));
     cudaMalloc(&c_device, k * k * sizeof(int));
     
-    int *prev_row_buffer_device;
-    cudaMalloc(&prev_row_buffer_device, m * sizeof(int));
+    int *prev_row_buffers_device;
+    cudaMalloc(&prev_row_buffers_device, p * m * sizeof(int));
     
-    int *temp_row_device;
-    cudaMalloc(&temp_row_device, m * sizeof(int));
+    int *temp_row_buffers_device;
+    cudaMalloc(&temp_row_buffers_device, p * m * sizeof(int));
     
+    int *halo_buffers_device; 
+    cudaMalloc(&halo_buffers_device, p * m * sizeof(int));
+
     cudaCheckError();
 
     cudaMemcpy(f_device, f_host, n * m * sizeof(int), cudaMemcpyHostToDevice);
@@ -100,28 +150,14 @@ void cerceteaza_paralel() {
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    int threads_per_block = p;
-    int blocks = 32;
-
-    int shared_mem_size = k * k * sizeof(int);
-
-    // Calculam total fire pentru a verifica distributia (optional debug)
-    int total_threads = blocks * threads_per_block;
-    cerr << "Configurare paralel: " << blocks << " blocuri x " << threads_per_block 
-         << " thread-uri. Total fire: " << total_threads << ". Distributie statica pe coloane.\n";
-
-    for (int i = 0; i < n; ++i) {
-        convolution_row_kernel<<<blocks, threads_per_block, shared_mem_size>>>(
-            f_device, c_device, prev_row_buffer_device, n, m, k, i, temp_row_device);
-        cudaCheckError();
-        
-        cudaDeviceSynchronize();
-        
-        cudaMemcpy(prev_row_buffer_device, &f_device[i * m], m * sizeof(int), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(&f_device[i * m], temp_row_device, m * sizeof(int), cudaMemcpyDeviceToDevice);
-    }
-
+    convolution_strip_kernel<<<1, p>>>(
+        f_device, c_device, n, m, k, 
+        prev_row_buffers_device, temp_row_buffers_device, halo_buffers_device
+    );
+    
+    cudaCheckError();
     cudaDeviceSynchronize();
+    
     auto end_time = chrono::high_resolution_clock::now();
 
     cudaMemcpy(f_host, f_device, n * m * sizeof(int), cudaMemcpyDeviceToHost);
@@ -136,8 +172,9 @@ void cerceteaza_paralel() {
 
     cudaFree(f_device);
     cudaFree(c_device);
-    cudaFree(prev_row_buffer_device);
-    cudaFree(temp_row_device);
+    cudaFree(prev_row_buffers_device);
+    cudaFree(temp_row_buffers_device);
+    cudaFree(halo_buffers_device);
 }
 
 int main(int argc, char* argv[]) {

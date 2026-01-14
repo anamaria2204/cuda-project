@@ -67,9 +67,6 @@ __global__ void convolution_compute_kernel(int *f, int *c, int n, int m, int k,
 
     int *my_prev_buffer = &prev_row_buffers[tid * m]; 
     int *my_temp_buffer = &temp_row_buffers[tid * m];
-    
-    // NU mai avem nevoie de salvarea halo aici si nici de __syncthreads()
-    // Deoarece Kernel 1 a garantat ca datele sunt acolo.
 
     int no_borders = 1;
 
@@ -98,7 +95,7 @@ __global__ void convolution_compute_kernel(int *f, int *c, int n, int m, int k,
                 // Cazul 2: Vecinul este 'i+1'
                 else if (x > i) {
                     int next_thread_start = end_row;
-                    // Aici e cheia: Citim din halo_buffers populate de Kernel 1
+                    // Citim din halo_buffers populate de Kernel 1
                     if (x == next_thread_start && (tid + 1) < total_threads) {
                         source_row = &halo_buffers[(tid + 1) * m]; 
                     } else {
@@ -140,11 +137,9 @@ void cerceteaza_paralel() {
     cudaMalloc(&f_device, n * m * sizeof(int));
     cudaMalloc(&c_device, k * k * sizeof(int));
     
-    // CONFIGURARE BLOCURI
     int blocks = 8;
-    int total_threads_global = blocks * p; // Numar total fire in tot gridul
+    int total_threads_global = blocks * p; 
 
-    // ALOCARE CORECTA: Inmultim cu total_threads_global, nu doar cu p!
     int *prev_row_buffers_device;
     cudaMalloc(&prev_row_buffers_device, total_threads_global * m * sizeof(int));
     

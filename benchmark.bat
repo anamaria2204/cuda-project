@@ -4,8 +4,8 @@ REM Script de benchmark pentru convolutie CUDA
 setlocal enabledelayedexpansion
 
 if "%~1"=="" (
-    echo Utilizare: %~nx0 [n] [m] [k] [p]
-    echo Exemplu: %~nx0 1000 1000 3 256
+    echo Utilizare: %~nx0 [n] [m] [k] [p] [b]
+    echo Exemplu: %~nx0 1000 1000 3 256 4
     exit /b 1
 )
 
@@ -13,14 +13,16 @@ set n=%~1
 set m=%~2
 set k=%~3
 set p=%~4
+set b=%~5
 
 if "!k!"=="" set k=3
 if "!p!"=="" set p=256
+if "!b!"=="" set b=0
 
 echo ====================================
 echo BENCHMARK CONVOLUTIE CUDA p=!p!
 echo ====================================
-echo Configurare: n=!n! m=!m! k=!k!
+echo Configurare: n=!n! m=!m! k=!k! p=!p!
 echo.
 
 REM Genereaza input
@@ -53,6 +55,9 @@ for /l %%i in (1,1,!count!) do (
 
 for /f %%m in ('powershell -NoProfile -Command "([double]!sum!) / !count!"') do set media_seq=%%m
 
+REM Salveaza baseline-ul pentru verificare
+copy output_sequential.txt output_baseline.txt > nul
+
 echo.
 echo Media SEQUENTIAL: !media_seq! ms
 
@@ -66,16 +71,22 @@ set sum=0
 
 for /l %%i in (1,1,!count!) do (
     echo Iteratia %%i...
-    for /f "usebackq delims=" %%a in (`parallel.exe !n! !m! !k! !p!`) do (
+    for /f "usebackq delims=" %%a in (`parallel.exe !n! !m! !k! !p! !b!`) do (
         set lastLine=%%a
     )
     echo Timp: !lastLine! ms
     
-    REM TESTARE: Compara output-ul cu cel al versiunii secventiale
+    REM TESTARE: Compara output-ul cu baseline-ul (din sequential)
     echo   Testare corectitudine...
-    fc output_sequential.txt output_parallel.txt > nul 2>&1
+    fc output_baseline.txt output_parallel.txt > nul 2>&1
     if !errorlevel! neq 0 (
         echo EROARE: Rezultatul paralel nu corespunde celui secvential!
+        type output_baseline.txt | head -5 > temp1.txt
+        type output_parallel.txt | head -5 > temp2.txt
+        echo Primele 5 linii baseline:
+        type temp1.txt
+        echo Primele 5 linii parallel:
+        type temp2.txt
         exit /b 1
     ) else (
         echo   OK - Rezultate identice!

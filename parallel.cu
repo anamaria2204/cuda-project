@@ -15,115 +15,115 @@ int k;
 int *c_host, *c_device;
 int p; // thread-uri pe bloc
 
-// Kernel pentru procesarea unui singur rând - in-place cu buffer pentru rândul anterior
-// Fiecare thread proceseaza o pozitie (row, j) din randul respectiv
+// Kernel: convolutie 3x3 in-place cu shared memory si block-based distribution
 __global__ void convolution_row_kernel(int *f, int *c, int *prev_row_buffer, int n, int m, int k, 
                                        int row_idx, int *temp_row) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = blockDim.x * gridDim.x;
 
-    if (j >= m) return;
+    extern __shared__ int shared_kernel[];
+    
+    // Incarca kernel 3x3 in shared memory
+    for (int idx = threadIdx.x; idx < k * k; idx += blockDim.x) {
+        shared_kernel[idx] = c[idx];
+    }
+    __syncthreads();
 
     int i = row_idx;
-    int suma = 0;
-    int no_borders = 1; // k == 3
+    int no_borders = 1;
 
-    for (int ki = -no_borders; ki <= no_borders; ++ki) {
-        int x = i + ki;
-        int x_clamped = (x < 0) ? 0 : (x >= n ? n - 1 : x);
+    // Distribuire coloane: m/total_threads + rest in primii thread-uri
+    int cols_per_thread = m / total_threads;
+    int remainder = m % total_threads;
 
-        int *source;
-
-        // Dacă rândul clamped este < i, folosim buffer (valoarea originală)
-        if (x_clamped < i) {
-            source = prev_row_buffer;
-        } else {
-            // Altfel, folosim valorile din f (care sunt originale pentru rândurile neprocessate)
-            source = &f[x_clamped * m];
-        }
-
-        for (int kj = -no_borders; kj <= no_borders; ++kj) {
-            int y = j + kj;
-            int y_clamped = (y < 0) ? 0 : (y >= m ? m - 1 : y);
-
-            suma += source[y_clamped] * c[(ki + no_borders) * k + (kj + no_borders)];
-        }
+    int start, end;
+    if (thread_id < remainder) {
+        start = thread_id * (cols_per_thread + 1);
+        end = start + cols_per_thread + 1;
+    } else {
+        start = remainder * (cols_per_thread + 1) + (thread_id - remainder) * cols_per_thread;
+        end = start + cols_per_thread;
     }
 
-    temp_row[j] = suma;
+    for (int j = start; j < end; j++) {
+        int suma = 0;
+
+        for (int ki = -no_borders; ki <= no_borders; ++ki) {
+            int x = i + ki;
+            int x_clamped = (x < 0) ? 0 : (x >= n ? n - 1 : x);
+
+            int *source;
+
+            // Dacă rândul clamped este < i, folosim buffer (valoarea originală)
+            if (x_clamped < i) {
+                source = prev_row_buffer;
+            if (x_clamped < i) {
+                source = prev_row_buffer;  // Randul anterior (original)
+            } else {
+                source = &f[x_clamped * m];  // Randul nemodificat   int y_clamped = (y < 0) ? 0 : (y >= m ? m - 1 : y);
+
+                // Folosim kernelul din shared memory in loc din global memory
+                suma += source[y_clamped] * shared_kernel[(ki + no_borders) * k + (kj + no_borders)];
+            }
+        temp_row[j] = suma;
+    }
 }
 
 void cerceteaza_paralel() {
     // Aloca memoria pe device
-    cudaMalloc(&f_device, n * m * sizeof(float));
-    cudaMalloc(&c_device, k * k * sizeof(float));
+    cudaMalloc(&f_device, n * m * sizeof(int));
+    cudaMalloc(&c_device, k * k * sizeof(int));
     cudaCheckError();
 
     // Buffer temporar pentru randul curent (pe device)
+    int *temre si copiere date GPU
+    cudaMalloc(&f_device, n * m * sizeof(int));
+    cudaMalloc(&c_device, k * k * sizeof(int));
+    
     int *temp_row_device;
     cudaMalloc(&temp_row_device, m * sizeof(int));
-    cudaCheckError();
-
-    // Buffer pentru rândul anterior (valoarea originală)
+    
     int *prev_row_buffer_device;
     cudaMalloc(&prev_row_buffer_device, m * sizeof(int));
     cudaCheckError();
 
-    // Copie date pe device
-    cudaMemcpy(f_device, f_host, n * m * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(c_device, c_host, k * k * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(f_device, f_host, n * m * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(c_device, c_host, k * k * sizeof(int), cudaMemcpyHostToDevice);
     cudaCheckError();
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    // Configurare blocuri pentru procesarea unui rând
-    int threads_per_block = p; // parametru configurable
-    int blocks = (m + threads_per_block - 1) / threads_per_block;
-
-    // Afisare configuratie paralel
+    int threads_per_block = p;
+    int blocks = 32;
     int total_threads = blocks * threads_per_block;
+    int shared_mem_size = k * k * sizeof(int);
+
     cerr << "Configurare paralel: " << blocks << " blocuri x " << threads_per_block 
          << " thread-uri = " << total_threads << " thread-uri total\n";
 
-    // Procesare rând cu rând - IN-PLACE
+    // Procesare rand cu rand (in-place)
     for (int i = 0; i < n; ++i) {
-        // Calcul rândul i pe device - cu buffer pentru rândul anterior
-        convolution_row_kernel<<<blocks, threads_per_block>>>(f_device, c_device, prev_row_buffer_device, n, m, k, i, temp_row_device);
+        convolution_row_kernel<<<blocks, threads_per_block, shared_mem_size>>>(f_device, c_device, prev_row_buffer_device, n, m, k, i, temp_row_device);
         cudaCheckError();
         cudaDeviceSynchronize();
-        cudaCheckError();
-
-        // Salvez rândul original (i) în buffer (înainte de suprascriere)
-        cudaMemcpy(prev_row_buffer_device, &f_device[i * m], m * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaCheckError();
-
-        // Copiez rezultatul inapoi în f_device (in-place) - pentru rândul i
-        cudaMemcpy(&f_device[i * m], temp_row_device, m * sizeof(float), cudaMemcpyDeviceToDevice);
+        
+        cudaMemcpy(prev_row_buffer_device, &f_device[i * m], m * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(&f_device[i * m], temp_row_device, m * sizeof(int), cudaMemcpyDeviceToDevice);
         cudaCheckError();
     }
 
     cudaDeviceSynchronize();
-    cudaCheckError();
-
     auto end_time = chrono::high_resolution_clock::now();
 
-    // Copie rezultatul final înapoi pe host
     cudaMemcpy(f_host, f_device, n * m * sizeof(float), cudaMemcpyDeviceToHost);
     cudaCheckError();
 
     chrono::duration<double, milli> delta = end_time - start_time;
     cout << fixed << setprecision(6) << delta.count();
 
-    // Salveaza rezultatul
     std::ofstream out("output_parallel.txt");
     scrie_matrice_dinamica(f_host, n, m, out);
     out.close();
-
-    // Eliberare memorie device
-    cudaFree(f_device);
-    cudaFree(c_device);
-    cudaFree(temp_row_device);
-    cudaFree(prev_row_buffer_device);
-}
 
 int main(int argc, char* argv[]) {
     if (argc < 5) {
